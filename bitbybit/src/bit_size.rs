@@ -18,6 +18,7 @@ impl Bits {
             9..=16 => "u16",
             17..=32 => "u32",
             33..=64 => "u64",
+            65..=128 => "u128",
             _ => return Err(syn::Error::new(span, BAD_SIZE)),
         };
         Ok(syn::Ident::new(ident_str, span))

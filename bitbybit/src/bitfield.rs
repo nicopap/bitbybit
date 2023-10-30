@@ -2,38 +2,63 @@ use proc_macro::TokenStream;
 use std::ops::{Deref, Range};
 use std::str::FromStr;
 
-use proc_macro2::{Ident, TokenTree};
+use proc_macro2::{Ident, Span, TokenTree};
 use quote::{quote, ToTokens};
 use syn::__private::TokenStream2;
-use syn::{Attribute, Data, DeriveInput, Field, GenericArgument, PathArguments, Type, Visibility};
+use syn::meta::ParseNestedMeta;
+use syn::{
+    Attribute, Data, DeriveInput, Field, GenericArgument, PathArguments, Token, Type, Visibility,
+};
+
+use crate::bit_size::Bits;
+
+#[derive(Default)]
+pub(crate) struct Config {
+    explicit_bits: Option<Bits>,
+    default: Option<syn::Expr>,
+}
+struct FullConfig {
+    bits: Bits,
+    default: Option<syn::Expr>,
+}
+
+impl Config {
+    pub(crate) fn parse(&mut self, meta: ParseNestedMeta) -> syn::Result<()> {
+        if meta.path.is_ident("default") {
+            let result1 = meta.input.parse::<Token![:]>();
+            let result2 = meta.input.parse::<Token![=]>();
+            if result1.is_err() && result2.is_err() {
+                return Err(meta.error("InvalidDefaultNextToken"));
+            }
+            self.default = Some(meta.input.parse()?);
+        } else {
+            let err = || meta.error("Error::InvalidAttribute");
+            let last_segment = meta.path.segments.last().ok_or_else(err)?;
+            let value = last_segment.ident.to_string();
+            let ("u", size) = value.split_at(1) else {
+                return Err(err());
+            };
+            self.explicit_bits = Some(Bits {
+                path: meta.path.clone(),
+                size: size.parse().map_err(|_| err())?,
+            });
+        }
+        Ok(())
+    }
+
+    fn explicit(self) -> syn::Result<FullConfig> {
+        let span = Span::call_site();
+        let Some(bits) = self.explicit_bits else {
+            return Err(syn::Error::new(span, "Error::MissingSize"));
+        };
+        let default = self.default;
+        Ok(FullConfig { bits, default })
+    }
+}
 
 /// In the code below, bools are considered to have 0 bits. This lets us distinguish them
 /// from u1
 const BITCOUNT_BOOL: usize = 0;
-
-/// Returns true if the number can be expressed by a regular data type like u8 or u32.
-/// 0 is special as it means bool (technically should be 1, but we use that for u1)
-const fn is_int_size_regular_type(size: usize) -> bool {
-    size == BITCOUNT_BOOL || size == 8 || size == 16 || size == 32 || size == 64 || size == 128
-}
-
-fn parse_arbitrary_int_type(s: &str) -> Result<usize, ()> {
-    if !s.starts_with('u') || s.len() < 2 {
-        return Err(());
-    }
-
-    let size = usize::from_str(s.split_at(1).1);
-    match size {
-        Ok(size) => {
-            if size >= 1 && size < 128 && !is_int_size_regular_type(size) {
-                Ok(size)
-            } else {
-                Err(())
-            }
-        }
-        Err(_) => Err(()),
-    }
-}
 
 // If a convert_type is given, that will be the final getter/setter type. If not, it is the base type
 enum CustomType {
@@ -41,135 +66,15 @@ enum CustomType {
     Yes(Type),
 }
 
-#[derive(Copy, Clone)]
-struct BaseDataSize {
-    /// The size of the raw_value field, e.g. u32
-    internal: usize,
+pub fn bitfield(config: Config, input: &syn::ItemStruct) -> syn::Result<TokenStream> {
+    let config = config.explicit()?;
 
-    /// The size exposed via raw_value() and new_with_raw_value(), e.g. u24
-    exposed: usize,
-}
-
-impl BaseDataSize {
-    const fn new(size: usize) -> Self {
-        let built_in_size = if size <= 8 {
-            8
-        } else if size <= 16 {
-            16
-        } else if size <= 32 {
-            32
-        } else if size <= 64 {
-            64
-        } else {
-            128
-        };
-        assert!(size <= built_in_size);
-        Self {
-            internal: built_in_size,
-            exposed: size,
-        }
-    }
-}
-
-pub fn bitfield(args: TokenStream, input: TokenStream) -> TokenStream {
-    let args: Vec<_> = proc_macro2::TokenStream::from(args).into_iter().collect();
-
-    if args.is_empty() {
-        panic!(
-            "bitfield! No arguments given, but need at least base data type (e.g. 'bitfield(u32)')"
-        );
-    }
-
-    // Parse arguments: the first argument is required and has the base data type. Further arguments are
-    // optional and are key:value pairs
-    let base_data_type = &args[0];
-    let mut default_value: Option<TokenStream2> = None;
-
-    enum ArgumentType {
-        Default,
-    }
-    let mut next_expected: Option<ArgumentType> = None;
-
-    fn handle_next_expected(
-        next_expected: &Option<ArgumentType>,
-        default_value: &mut Option<TokenStream2>,
-        token_stream: TokenStream2,
-    ) {
-        match next_expected {
-            None => panic!("bitfield!: Unexpected token {}. Example of valid syntax: #[bitfield(u32, default = 0)]", token_stream),
-            Some(ArgumentType::Default) => {
-                *default_value = Some(token_stream);
-            }
-        }
-    }
-    for arg in args.iter().skip(1) {
-        match arg {
-            TokenTree::Punct(p) => match p.as_char() {
-                ',' => next_expected = None,
-                '=' | ':' => (),
-                _ => panic!(
-                    "bitfield!: Expected ',', '=' or ':' in argument list. Saw '{}'",
-                    p
-                ),
-            },
-            TokenTree::Ident(sym) => {
-                if next_expected.is_some() {
-                    // We might end up here if we refer to a constant, like 'default = SOME_CONSTANT'
-                    handle_next_expected(&next_expected, &mut default_value, sym.to_token_stream());
-                } else {
-                    match sym.to_string().as_str() {
-                        "default" => {
-                            if default_value.is_some() {
-                                panic!("bitfield!: default must only be specified at most once");
-                            }
-                            next_expected = Some(ArgumentType::Default)
-                        }
-                        _ => panic!(
-                            "bitfield!: Unexpected argument {}. Supported: 'default'",
-                            sym
-                        ),
-                    }
-                }
-            }
-            TokenTree::Literal(literal) => {
-                // We end up here if we see a literal, like 'default = 0x1234'
-                handle_next_expected(
-                    &next_expected,
-                    &mut default_value,
-                    literal.to_token_stream(),
-                );
-            }
-            t => panic!("bitfield!: Unexpected token {}. Example of valid syntax: #[bitfield(u32, default = 0)]", t),
-        }
-    }
-
-    // If an arbitrary-int is specified as a base-type, we only use that when exposing it
-    // (e.g. through raw_value() and for bounds-checks). The actual raw_value field will be the next
-    // larger integer field
-    let base_data_size = match base_data_type.to_string().as_str() {
-        "u8" => BaseDataSize::new(8),
-        "u16" => BaseDataSize::new(16),
-        "u32" => BaseDataSize::new(32),
-        "u64" => BaseDataSize::new(64),
-        "u128" => BaseDataSize::new(128),
-        s if parse_arbitrary_int_type(s).is_ok() => {
-            BaseDataSize::new(parse_arbitrary_int_type(s).unwrap())
-        }
-        _ => {
-            return syn::Error::new_spanned(
-                &base_data_type,
-                format!("bitfield!: Supported values for base data type are u8, u16, u32, u64, u128. {} is invalid", base_data_type.to_string().as_str()),
-            ).to_compile_error().into();
-        }
-    };
-    let internal_base_data_type =
-        syn::parse_str::<Type>(format!("u{}", base_data_size.internal).as_str())
-            .unwrap_or_else(|_| panic!("bitfield!: Error parsing internal base data type"));
+    let base_data_type = &config.bits;
+    let default_value = &config.default;
 
     let one = syn::parse_str::<syn::LitInt>(format!("1u{}", base_data_size.internal).as_str())
         .unwrap_or_else(|_| panic!("bitfield!: Error parsing one literal"));
 
-    let input = syn::parse_macro_input!(input as DeriveInput);
     let struct_name = input.ident;
     let struct_vis = input.vis;
     let struct_attrs = input.attrs;
@@ -478,7 +383,7 @@ fn make_new_with_constructor(
     struct_vis: &Visibility,
     internal_base_data_type: &Type,
     base_data_type: &TokenTree,
-    base_data_size: BaseDataSize,
+    base_data_size: Bits,
     field_definitions: &[FieldDefinition],
 ) -> (TokenStream2, Vec<TokenStream2>) {
     if !cfg!(feature = "experimental_builder_syntax") {

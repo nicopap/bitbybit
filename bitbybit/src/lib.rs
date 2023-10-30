@@ -5,13 +5,27 @@ use syn::parse_macro_input;
 mod bit_size;
 mod bitenum;
 mod bitfield;
+mod bitfield_attr;
 
 /// Defines a bitfield: `#[bitfield(<base-data-type>, default = 0)]`
 /// `<base-data-type>` is a data type like [`u32`] which is used to represent all the bits of the bitfield.
 /// `default` is an optional default when the bitfield is created
 #[proc_macro_attribute]
 pub fn bitfield(args: TokenStream1, input: TokenStream1) -> TokenStream1 {
-    bitfield::bitfield(args, input)
+    let mut config = bitfield::Config::default();
+
+    let config_parser = syn::meta::parser(|meta| config.parse(meta));
+    parse_macro_input!(args with config_parser);
+
+    let input = parse_macro_input!(input as syn::ItemStruct);
+    match bitfield::bitfield(config, &input) {
+        Ok(stream) => stream.into(),
+        Err(err) => {
+            let error = err.into_compile_error();
+            let input = bitfield::fallback_impl(&input);
+            quote!(#input #error).into()
+        }
+    }
 }
 
 /// Defines a bitenum: `#[bitenum(<base-data-type>, exhaustive = true)]`
