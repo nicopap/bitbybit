@@ -17,9 +17,10 @@ pub(crate) enum Mode {
 
 #[derive(Clone, Copy, Default, PartialEq)]
 pub(crate) struct BitfieldConfig {
-    range: (usize, usize),
-    mode: Option<Mode>,
-    stride: Option<NonZeroUsize>,
+    pub range: (usize, usize),
+    pub mode: Option<Mode>,
+    pub stride: Option<NonZeroUsize>,
+    pub set: bool,
 }
 
 struct ParseInt(usize);
@@ -32,6 +33,17 @@ impl syn::parse::Parse for ParseInt {
 }
 
 impl BitfieldConfig {
+    pub fn parse_attr(&mut self, attr: &syn::Attribute) -> syn::Result<()> {
+        if attr.path().is_ident("bit") {
+            attr.parse_nested_meta(|meta| self.parse_bit(meta))?;
+            self.set = true;
+        } else if attr.path().is_ident("bits") {
+            attr.parse_nested_meta(|meta| self.parse_bits(meta))?;
+            self.set = true;
+        }
+        Ok(())
+    }
+
     fn parse_any(&mut self, meta: ParseNestedMeta) -> syn::Result<Parsed> {
         if meta.path.is_ident("r") || meta.path.is_ident("rw") || meta.path.is_ident("w") {
             if let Some(mode) = self.mode {
@@ -88,4 +100,8 @@ impl BitfieldConfig {
         }
         Ok(())
     }
+}
+
+pub(crate) fn field_attr_path(attr: &syn::Attribute) -> bool {
+    attr.path().is_ident("bit") || attr.path().is_ident("bits")
 }

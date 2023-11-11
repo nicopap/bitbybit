@@ -23,7 +23,7 @@ impl Bits {
         };
         Ok(syn::Ident::new(ident_str, span))
     }
-    fn is_arbitrary_int(&self) -> bool {
+    pub(crate) fn is_arbitrary_int(&self) -> bool {
         let is_ident = self.path.get_ident().is_some();
         let is_native_int = [8, 16, 32, 64].contains(&self.size);
         !is_native_int && is_ident
@@ -44,5 +44,23 @@ impl Bits {
     }
     pub(crate) fn reader(&self) -> Option<TokenStream> {
         self.is_arbitrary_int().then_some(quote!(.value()))
+    }
+    pub(crate) fn from_ty(ty: &syn::Type) -> syn::Result<Self> {
+        // TODO(err): Extract this, list valid types
+        let err = || syn::Error::new_spanned(ty, "Expected a valid bitsized type");
+        let syn::Type::Path(ty) = ty else {
+            return Err(err());
+        };
+        let last_segment = ty.path.segments.last().ok_or_else(err)?;
+        let value = last_segment.ident.to_string();
+        let size = match value.split_at(1) {
+            ("u", size) => size.parse().map_err(|_| err())?,
+            ("b", "ool") => 1,
+            _ => return Err(err()),
+        };
+        Ok(Self {
+            path: ty.path.clone(),
+            size,
+        })
     }
 }

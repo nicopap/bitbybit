@@ -1,7 +1,7 @@
 use std::fmt;
 
 use proc_macro2::{Span, TokenStream};
-use quote::{quote, spanned::Spanned};
+use quote::{format_ident, quote, spanned::Spanned};
 use syn::{meta::ParseNestedMeta, Token};
 
 use crate::bit_size::Bits;
@@ -103,10 +103,12 @@ impl syn::parse::Parse for Exhaustive {
 
 #[derive(Default)]
 pub(crate) struct Config {
+    path_prefix: Option<syn::Path>,
     explicit_bits: Option<Bits>,
     explicit_exhaustive: Option<Exhaustive>,
 }
 struct FullConfig {
+    path_prefix: syn::Path,
     bits: Bits,
     exhaustive: Exhaustive,
 }
@@ -120,6 +122,9 @@ impl Config {
                 return Err(meta.error(Error::InvalidExhaustiveNextToken));
             }
             self.explicit_exhaustive = Some(meta.input.parse()?);
+        } else if meta.path.is_ident("crate_path") {
+            let value = meta.value()?;
+            self.path_prefix = Some(value.parse()?);
         } else {
             let err = || meta.error(Error::InvalidAttribute);
             let last_segment = meta.path.segments.last().ok_or_else(err)?;
@@ -144,7 +149,12 @@ impl Config {
             span,
             kind: Exhaustiveness::False,
         });
-        Ok(FullConfig { bits, exhaustive })
+        let path_prefix = self.path_prefix.unwrap_or(syn::parse_quote!(::bitbybit));
+        Ok(FullConfig {
+            bits,
+            exhaustive,
+            path_prefix,
+        })
     }
 }
 
@@ -252,8 +262,10 @@ pub(crate) fn bitenum(config: Config, input: &syn::ItemEnum) -> syn::Result<Toke
     check_explicit_exhaustive(&config, &input)?;
 
     let bits = config.bits;
+    let size = bits.size;
     let (base_type, qualified_type) = (bits.base_type()?, bits.qualified_path()?);
     let (raw_value_constructor, reader) = (bits.constructor()?, bits.reader());
+    let prefix = &config.path_prefix;
 
     let non_exhaustive = config.exhaustive.matches(false);
     let ok = non_exhaustive.then_some(quote!(Ok));
@@ -272,6 +284,9 @@ pub(crate) fn bitenum(config: Config, input: &syn::ItemEnum) -> syn::Result<Toke
         quote!( #( #cfg_attrs )* (#value) => #ok(Self::#variant_name) )
     });
     let (attrs, vis, name, variants) = (&input.attrs, &input.vis, &input.ident, &input.variants);
+    let self_bits = quote!(<#name as #prefix::BitSize<#base_type>>::BITS);
+    let base_bits = quote!(<#base_type as #prefix::BitSize<#base_type>>::BITS);
+    let lower_than = format_ident!("LowerThan{name}");
     Ok(quote! {
         #[derive(Copy, Clone)]
         #( #attrs )*
@@ -291,6 +306,34 @@ pub(crate) fn bitenum(config: Config, input: &syn::ItemEnum) -> syn::Result<Toke
                     #( #new_match_branches ,)*
                     #new_default_branch
                 }
+            }
+        }
+
+        #[doc(hidden)]
+        struct #lower_than<const OFFSET: u32>;
+        impl <const OFFSET: u32> #lower_than<OFFSET> {
+            const OK: () = assert!(OFFSET + #self_bits <= #base_bits, "Offset is too large");
+        }
+        impl #prefix::BitSize<#base_type> for #name {
+            type Unpacked = #new_return_type;
+
+            const BITS: u32 = #size as u32;
+
+            #[inline(always)]
+            fn from_offset<const OFFSET: u32>(data: #base_type) -> Self::Unpacked {
+                let () = #lower_than::<OFFSET>::OK;
+                const MASK: #base_type = (1 << #self_bits) - 1;
+                let masked = (data >> OFFSET) & MASK;
+                Self::new_with_raw_value(#raw_value_constructor(masked))
+
+            }
+            #[inline(always)]
+            fn with_offset<const OFFSET: u32>(self, data: &#base_type) -> #base_type {
+                let () = #lower_than::<OFFSET>::OK;
+                const MASK: #base_type = (1 << #self_bits) - 1;
+                let value = self.raw_value().value() << OFFSET;
+                // We assume all bits over Self::BITS are always set to 0
+                (*data & !(MASK << OFFSET)) | value
             }
         }
     })
