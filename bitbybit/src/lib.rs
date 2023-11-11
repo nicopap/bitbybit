@@ -1,4 +1,4 @@
-use std::{ops, marker::PhantomData};
+use std::ops;
 
 pub use arbitrary_int;
 use arbitrary_int::UInt;
