@@ -1,5 +1,17 @@
 # Changelog
 
+## bitbybit 2.0.1
+
+Note: The 2.0.0 release on crates.io was accidentally published from a stale commit and is missing
+some of the changes listed under 2.0.0 below (most notably, a builder was still provided for types
+whose entire range wouldn't be covered). This release supersedes it; the full 2.0.0 changelog
+applies as of 2.0.1.
+
+### Fixed
+
+- The builder now works for bitfields that have a field named `value`; internal names no longer
+  clash with user field names. (@robamu)
+
 ## bitbybit 2.0.0
 
 This version expects arbitrary-int 2.x.
